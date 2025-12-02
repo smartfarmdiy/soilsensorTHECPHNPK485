@@ -1,0 +1,173 @@
+// ====== CONFIG ตรงนี้ให้ดูค่าจาก "คู่มือ config" ของเซนเซอร์ ======
+
+// 1) Slave ID จากคู่มือ (เช่น 1, 2, 10 ...)
+const uint8_t SLAVE_ID = 0x01;   // ถ้าคู่มือเขียน 1 ก็ใช้ 0x01
+
+// 2) Register Start & จำนวน Register ที่ต้องการอ่าน
+//    - ถ้าคู่มือบอกว่า N อยู่ที่ 0x0001, P = 0x0002, K = 0x0003
+//      ให้ใช้ start = 0x0001, num = 3
+//    - ถ้าต่างจากนี้ ให้เปลี่ยนให้ตรง
+const uint16_t REG_START = 0x0001;   // Address ของ N (ตัวแรกในชุด)
+const uint16_t REG_NUM   = 3;        // จำนวน register ที่อ่าน (N, P, K = 3 ช่อง)
+
+// 3) Serial / RS485 Parameter
+//    - ถ้าคู่มือเขียน 4800-8-N-1 => Serial2.begin(4800, SERIAL_8N1, ...);
+//    - ถ้าเขียน 9600-E-1 => ใช้ SERIAL_8E1 เป็นต้น
+#define RXD2 16   // RO จาก MAX485
+#define TXD2 17   // DI ไป MAX485
+#define RE_DE 4   // ขาควบคุม DE+RE
+
+// =======================================================
+
+void preTransmission() {
+  digitalWrite(RE_DE, HIGH); // MAX485 โหมดส่ง
+}
+
+void postTransmission() {
+  delayMicroseconds(200);
+  digitalWrite(RE_DE, LOW);  // MAX485 โหมดรับ
+}
+
+// ฟังก์ชัน CRC16 Modbus มาตรฐาน
+uint16_t Modbus_CRC16(uint8_t *buf, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (int i = 0; i < 8; i++) {
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void sendReadHoldingRegister(uint8_t id, uint16_t startAddr, uint16_t numRegs) {
+  uint8_t frame[8];
+  frame[0] = id;                // Slave ID
+  frame[1] = 0x03;              // Function 0x03: Read Holding Registers
+  frame[2] = startAddr >> 8;    // Start Address High
+  frame[3] = startAddr & 0xFF;  // Start Address Low
+  frame[4] = numRegs >> 8;      // Number of Registers High
+  frame[5] = numRegs & 0xFF;    // Number of Registers Low
+
+  uint16_t crc = Modbus_CRC16(frame, 6);
+  frame[6] = crc & 0xFF;        // CRC Low
+  frame[7] = crc >> 8;          // CRC High
+
+  preTransmission();
+  Serial2.write(frame, 8);
+  Serial2.flush();
+  postTransmission();
+}
+
+bool readResponse(uint16_t *values, uint8_t numRegs) {
+  unsigned long startTime = millis();
+  // รอ header: ID, FUNC, BYTE COUNT
+  while (Serial2.available() < 5 && (millis() - startTime) < 1000) {
+    // wait
+  }
+
+  if (Serial2.available() < 5) {
+    Serial.println("Timeout waiting for header");
+    return false;
+  }
+
+  uint8_t id    = Serial2.read();
+  uint8_t func  = Serial2.read();
+  uint8_t bytes = Serial2.read();
+
+  if (id != SLAVE_ID || func != 0x03) {
+    Serial.println("Invalid response header");
+    return false;
+  }
+
+  if (bytes != numRegs * 2) {
+    Serial.print("Unexpected byte count: ");
+    Serial.println(bytes);
+  }
+
+  uint8_t dataBytes[64];
+  uint8_t toRead = bytes + 2; // data + CRC
+  uint8_t idx = 0;
+
+  startTime = millis();
+  while (idx < toRead && (millis() - startTime) < 1000) {
+    if (Serial2.available()) {
+      dataBytes[idx++] = Serial2.read();
+    }
+  }
+
+  if (idx < toRead) {
+    Serial.println("Timeout while reading data");
+    return false;
+  }
+
+  // ตรวจ CRC
+  uint8_t respFrame[3 + 64];
+  respFrame[0] = id;
+  respFrame[1] = func;
+  respFrame[2] = bytes;
+  for (uint8_t i = 0; i < bytes + 2; i++) {
+    respFrame[3 + i] = dataBytes[i];
+  }
+
+  uint16_t crcCalc = Modbus_CRC16(respFrame, 3 + bytes);
+  uint16_t crcResp = dataBytes[bytes] | (dataBytes[bytes + 1] << 8);
+
+  if (crcCalc != crcResp) {
+    Serial.println("CRC mismatch");
+    return false;
+  }
+
+  // แปลง data → values[]
+  for (uint8_t i = 0; i < numRegs; i++) {
+    uint8_t hi = dataBytes[i * 2];
+    uint8_t lo = dataBytes[i * 2 + 1];
+    values[i] = (hi << 8) | lo;
+  }
+
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("ESP32 + MAX485 + Soil NPK RS485 (Config จากคู่มือ)");
+
+  pinMode(RE_DE, OUTPUT);
+  digitalWrite(RE_DE, LOW); // เริ่มจากโหมดรับ
+
+  // ตรงนี้ให้ตั้งตามคู่มือ: Baudrate + Format
+  // ตัวอย่าง: 9600-8-N-1
+  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+
+  delay(1000);
+}
+
+void loop() {
+  uint16_t regs[REG_NUM];
+
+  Serial.println("Requesting NPK...");
+  sendReadHoldingRegister(SLAVE_ID, REG_START, REG_NUM);
+  delay(200); // เวลารอ Slave ตอบกลับ
+
+  if (readResponse(regs, REG_NUM)) {
+    // ตรงนี้สมมติว่า regs[0]=N, regs[1]=P, regs[2]=K
+    // ถ้าคู่มือบอกว่าต้อง /10 หรือ /100 ให้ใส่เพิ่มด้านล่าง
+    float N = regs[0];  // ถ้าในคู่มือบอกว่า scale 0.1: float N = regs[0] / 10.0;
+    float P = regs[1];
+    float K = regs[2];
+
+    Serial.print("N: "); Serial.print(N);
+    Serial.print("  P: "); Serial.print(P);
+    Serial.print("  K: "); Serial.println(K);
+  } else {
+    Serial.println("Read failed");
+  }
+
+  delay(2000);
+}
